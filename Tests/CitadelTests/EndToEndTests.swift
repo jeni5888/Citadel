@@ -201,6 +201,127 @@ final class EndToEndTests: XCTestCase {
         )
     }
 
+    // MARK: - listDirectory releases its directory handle (Duomote fork)
+
+    /// `listDirectory` must send `SSH_FXP_CLOSE` for the handle `opendir` gave it.
+    ///
+    /// Upstream never did. The leak is invisible to the client — the listing is correct and the
+    /// call returns — and it only shows up on the SERVER, which keeps a directory handle (and its
+    /// file descriptor) allocated until CLOSE arrives. So this fence observes the server's side:
+    /// `SFTPServerInboundHandler` drops its `directories[id]` entry when it handles CLOSE, and
+    /// nothing else retains the handle the delegate returned, so the handle object is deallocated
+    /// exactly when the close was really sent. A weak reference is therefore a direct reading of
+    /// "the server freed it", not a proxy for it.
+    func testListDirectorySendsCloseSoTheServerReleasesTheDirectoryHandle() async throws {
+        final class Listing: SFTPDirectoryHandle {
+            func listFiles(context: SSHContext) async throws -> [SFTPFileListing] {
+                [SFTPFileListing(path: [SFTPPathComponent(
+                    filename: "one.txt", longname: "one.txt", attributes: .none)])]
+            }
+        }
+
+        final class SFTP: SFTPDelegate, @unchecked /* for testing */ Sendable {
+            /// The handle the server still holds. WEAK on purpose: this is the measurement.
+            weak var lastHandle: Listing?
+            /// The positive control, and it cannot be `lastHandle != nil` — that reference is
+            /// expected to go away, so reading it as "did the server open a directory" makes the
+            /// row red exactly when the fix works. Measured: the first version of this test did
+            /// that and failed with "the server never opened a directory" on a correct close.
+            var openDirectoryCalls = 0
+
+            func realPath(for canonicalUrl: String, context: SSHContext) async throws -> [SFTPPathComponent] {
+                [SFTPPathComponent(filename: canonicalUrl, longname: canonicalUrl, attributes: .none)]
+            }
+
+            func openDirectory(atPath path: String, context: SSHContext) async throws -> SFTPDirectoryHandle {
+                let handle = Listing()
+                lastHandle = handle
+                openDirectoryCalls += 1
+                return handle
+            }
+        }
+
+        try await runTest(
+            perform: { server, client in
+                let sftpServer = SFTP()
+                server.enableSFTP(withDelegate: sftpServer)
+                let sftp = try await client.openSFTP()
+
+                let names = try await sftp.listDirectory(atPath: "/test/citadel/dir")
+                XCTAssertEqual(names.flatMap(\.components).map(\.filename), ["one.txt"],
+                               "the listing itself must be unchanged by the close")
+                XCTAssertEqual(sftpServer.openDirectoryCalls, 1,
+                               "the server opened \(sftpServer.openDirectoryCalls) directories "
+                               + "instead of exactly one, so this row measured something else")
+
+                // A STATE wait, not a timing bound: the server clears its entry before it writes
+                // the status, but the final release happens on its event loop, so the object can
+                // outlive the client's `await` by a hop. The budget is a watchdog that turns "the
+                // close was never sent" into a red test instead of a hung one.
+                var released = false
+                for _ in 0..<500 where !released {
+                    if sftpServer.lastHandle == nil { released = true; break }
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                XCTAssertTrue(released,
+                              "the server still holds the directory handle, so listDirectory sent "
+                              + "no SSH_FXP_CLOSE — one descriptor leaked for the life of the session")
+
+                try await sftp.close()
+            },
+            matchingError: { _ in false },
+            expectsFailure: false
+        )
+    }
+
+    /// `closeHandle` CAN fail, which is what makes the `try?` on `listDirectory`'s failing path
+    /// load-bearing rather than defensive noise.
+    ///
+    /// This row exists because the obvious test — "kill the channel mid-listing and check which
+    /// error comes out" — is **unable to discriminate** the defect it would be written for. The
+    /// listing's own error there is `SFTPError.connectionClosed` (`SFTPResponses.close()` fails
+    /// every outstanding promise with it) while a close that was allowed to throw answers
+    /// `ChannelError.alreadyClosed` — but `alreadyClosed` is ALSO the honest answer when the
+    /// channel dies between two READDIRs rather than during one, and nothing in the harness can
+    /// decide which of the two happened. Measured: with `try?` replaced by `try await`, that row
+    /// stayed GREEN. So it was deleted rather than kept as a passing row that proves nothing.
+    ///
+    /// What is left is the half that IS decidable: on a dead channel the close fails, so a bare
+    /// `try await` in the `catch` would replace the listing's cause with the close's.
+    func testClosingADirectoryHandleFailsOnADeadChannelWhichIsWhyTheFailingPathSwallowsIt() async throws {
+        final class SFTP: SFTPDelegate, @unchecked /* for testing */ Sendable {
+            func realPath(for canonicalUrl: String, context: SSHContext) async throws -> [SFTPPathComponent] {
+                [SFTPPathComponent(filename: canonicalUrl, longname: canonicalUrl, attributes: .none)]
+            }
+        }
+
+        try await runTest(
+            perform: { server, client in
+                server.enableSFTP(withDelegate: SFTP())
+                let sftp = try await client.openSFTP()
+
+                // A healthy channel first — the positive control, so a row that could never send
+                // anything cannot pass by being equally unable to send the close.
+                XCTAssertTrue(sftp.isActive, "the SFTP channel did not open")
+                _ = try await sftp.getRealPath(atPath: "/test/citadel")
+
+                try await sftp.close()
+                XCTAssertFalse(sftp.isActive, "the channel is supposed to be gone now")
+
+                do {
+                    // The handle value is irrelevant: the write never reaches a server.
+                    try await sftp.closeHandle(ByteBuffer(integer: UInt32(0), endianness: .big))
+                    XCTFail("closing a handle on a dead channel succeeded, so the `try?` on "
+                            + "listDirectory's failing path guards nothing and could be dropped")
+                } catch {
+                    // Exactly the error `try?` swallows so the listing's own cause survives.
+                }
+            },
+            matchingError: { _ in false },
+            expectsFailure: false
+        )
+    }
+
     func testSetAttributes() async throws {
         final class SFTP: SFTPDelegate, @unchecked /* for testing */ Sendable {
             var fileAttributes: SFTPFileAttributes?

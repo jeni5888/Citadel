@@ -1,5 +1,6 @@
 @testable import Citadel
 import NIO
+import NIOConcurrencyHelpers
 @preconcurrency import NIOSSH
 import XCTest
 import Foundation
@@ -67,6 +68,141 @@ final class WithExecTests: XCTestCase {
             try await client.close()
         } catch let error as ChannelError where error == .alreadyClosed {
             // Already cleaned up
+        }
+    }
+
+    // MARK: - Dropping an executeCommandStream closes its channel (Duomote fork)
+
+    /// A recorded server-side command that runs until the channel goes away.
+    ///
+    /// `ExecHandler.channelInactive` calls ``ExecCommandContext/terminate()``, so `didTerminate`
+    /// is a direct reading of "the client closed the exec channel" — the protocol event, not a
+    /// proxy for it.
+    private final class NeverEndingExec: ExecDelegate, @unchecked Sendable {
+        final class Ctx: ExecCommandContext {
+            let onTerminate: @Sendable () -> Void
+            init(onTerminate: @escaping @Sendable () -> Void) { self.onTerminate = onTerminate }
+            func terminate() async throws { onTerminate() }
+        }
+
+        // `NIOLockedValueBox`, not `NSLock`: `start` is async and `terminate` runs on the
+        // server's event loop, and NSLock's `lock()` is unavailable from an async context
+        // (an error in Swift 6 mode).
+        private let _didTerminate = NIOLockedValueBox<Bool>(false)
+        private let _didStart = NIOLockedValueBox<Bool>(false)
+
+        var didTerminate: Bool { _didTerminate.withLockedValue { $0 } }
+        var didStart: Bool { _didStart.withLockedValue { $0 } }
+
+        func setEnvironmentValue(_ value: String, forKey key: String) async throws {}
+
+        func start(command: String, outputHandler: ExecOutputHandler) async throws -> ExecCommandContext {
+            _didStart.withLockedValue { $0 = true }
+            // Nothing is written and `succeed` is never called: the command is still running, the
+            // way `sleep 60` is. Only a channel close can end it.
+            let flag = _didTerminate
+            return Ctx { flag.withLockedValue { $0 = true } }
+        }
+    }
+
+    /// Dropping the stream from ``SSHClient/executeCommandStream(_:environment:inShell:)`` must
+    /// end the command's server-side context.
+    ///
+    /// **"Ends the command" is true of THIS server and must not be read as true of every one.**
+    /// `ExecHandler.channelInactive` calls ``ExecCommandContext/terminate()``, so against
+    /// Citadel's own server the channel close alone is enough. Against OpenSSH it is NOT:
+    /// measured on loopback against OpenSSH 10.3p1, a cancelled `sleep 300` was still alive 30 s
+    /// after the close, which is why the cancellation path also sends a `signal` request — see
+    /// the row below. This row owns the channel-close half; that one owns the signal.
+    ///
+    /// Upstream built that stream with `makeStream()` and registered no `onTermination`, and the
+    /// public entry point keeps only `.output` — it discards the `Channel` that
+    /// `_executeCommandStream` hands back. So a consumer that walked away, or whose task was
+    /// cancelled, sent NOTHING: the remote command ran to its own end while the caller believed
+    /// it had given the channel back. A caller that budgets its concurrent channels then
+    /// understates what is open on the host by one per abandoned exec.
+    func testDroppingTheCommandStreamTerminatesTheServerSideCommandContext() async throws {
+        try await runTest(timeout: .seconds(20)) { server, client in
+            let exec = NeverEndingExec()
+            server.enableExec(withDelegate: exec)
+
+            // Scoped so the stream is released at the end of the block — this IS the "consumer
+            // walks away" case, with no cancellation involved.
+            do {
+                let stream = try await client.executeCommandStream("sleep-forever")
+                var iterator = stream.makeAsyncIterator()
+
+                // Wait for the STATE "the server started the command". Until then there is nothing
+                // to terminate and the row would pass without measuring anything.
+                var started = false
+                for _ in 0..<2_000 where !started {
+                    if exec.didStart { started = true; break }
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                XCTAssertTrue(started, "the server never started the command — nothing was measured")
+                XCTAssertFalse(exec.didTerminate,
+                               "the command was terminated before this row dropped the stream, so "
+                               + "a later termination would prove nothing")
+                _ = iterator  // keeps the iterator alive until the scope ends
+            }
+
+            var terminated = false
+            for _ in 0..<2_000 where !terminated {
+                if exec.didTerminate { terminated = true; break }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertTrue(terminated,
+                          "the exec channel was never closed, so the command is still running on "
+                          + "the host although its stream is gone")
+        }
+    }
+
+    /// The shape that actually bites — a CANCELLED consumer.
+    ///
+    /// **What this row fences is the channel close, NOT the signal, and that limit is stated
+    /// rather than implied.** `ExecHandler` does not act on `SignalRequest` — its
+    /// `userInboundEventTriggered` has no arm for it and the `default` arm only forwards the
+    /// event — so this server cannot observe the signal at all, and nothing here inserts a
+    /// handler that could. What it asserts is that the cancellation reaches
+    /// ``ExecCommandContext/terminate()``, which `ExecHandler.channelInactive` calls, i.e. that
+    /// the channel was really closed. Red (by timeout) without the change.
+    ///
+    /// That `ExecHandler` ignores the request is also why sending it is safe: an unhandled channel
+    /// request whose `wantReply` is `false` costs the server nothing.
+    ///
+    /// **The signal itself is only observable against a real `sshd`**, and the consumer's own live
+    /// suite is where it is fenced — against OpenSSH 10.3p1 the close alone left a cancelled
+    /// `sleep 300` alive for 30 s, and with the signal the command and the child of its `sh -c`
+    /// wrapper were gone on the first poll.
+    func testCancellingTheConsumerSignalsTheRemoteProcessAndThenClosesTheChannel() async throws {
+        try await runTest(timeout: .seconds(20)) { server, client in
+            let exec = NeverEndingExec()
+            server.enableExec(withDelegate: exec)
+
+            let consumer = Task {
+                let stream = try await client.executeCommandStream("sleep-forever")
+                for try await _ in stream {}
+            }
+
+            var started = false
+            for _ in 0..<2_000 where !started {
+                if exec.didStart { started = true; break }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertTrue(started, "the server never started the command — nothing was measured")
+            XCTAssertFalse(exec.didTerminate, "terminated before the cancellation")
+
+            consumer.cancel()
+            _ = try? await consumer.value
+
+            var terminated = false
+            for _ in 0..<2_000 where !terminated {
+                if exec.didTerminate { terminated = true; break }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertTrue(terminated,
+                          "a cancelled consumer left the command running on the host: the slot its "
+                          + "caller gave back no longer describes the host")
         }
     }
 

@@ -168,20 +168,22 @@ public final class SFTPClient: Sendable {
             self.logger.warning("SFTP server returned bad response to open file request, this is a protocol error")
             throw SFTPError.invalidResponse
         }
-        
-        var names = [SFTPMessage.Name]()
-        var response = try await sendRequest(
-            .readdir(
-                .init(
-                    requestId: self.allocateRequestId(),
-                    handle: handle.handle
-                )
-            )
-        )
-        
-        while case .name(let name) = response {
-            names.append(name)
-            response = try await sendRequest(
+
+        // The directory handle is closed on EVERY exit path, success and failure alike.
+        //
+        // Upstream returned `names` without ever sending `SSH_FXP_CLOSE`, and the handle is a
+        // plain value with no `deinit`, so nothing else closed it either. OpenSSH's `sftp-server`
+        // keeps a directory handle (and its file descriptor) allocated after EOF and frees it only
+        // on CLOSE, so every listing cost one descriptor for the LIFETIME of the SFTP session. A
+        // client that keeps one long-lived session per host therefore stops being able to open
+        // anything after a few hundred listings, on a session that is otherwise healthy — observed
+        // as `SSH_FX_FAILURE` (status 4) answering a later request.
+        //
+        // `closeHandle` is `try?`: a close that fails must not replace the error the caller is
+        // actually interested in, and on the failing path the channel may already be gone.
+        do {
+            var names = [SFTPMessage.Name]()
+            var response = try await sendRequest(
                 .readdir(
                     .init(
                         requestId: self.allocateRequestId(),
@@ -189,9 +191,50 @@ public final class SFTPClient: Sendable {
                     )
                 )
             )
+
+            while case .name(let name) = response {
+                names.append(name)
+                response = try await sendRequest(
+                    .readdir(
+                        .init(
+                            requestId: self.allocateRequestId(),
+                            handle: handle.handle
+                        )
+                    )
+                )
+            }
+
+            // `try await` on the SUCCESS path: a close the server refuses means the handle is
+            // still allocated, which is the very leak this change exists to end. Swallowing that
+            // would hand the caller a correct listing and the old defect. The failing path below
+            // is the opposite case — see the comment above.
+            try await closeHandle(handle.handle)
+            return names
+        } catch {
+            try? await closeHandle(handle.handle)
+            throw error
         }
-        
-        return names
+    }
+
+    /// Sends `SSH_FXP_CLOSE` for `handle` and checks the server's answer.
+    ///
+    /// SSH_FXP_CLOSE is handle-agnostic in SFTP v3 — the same request closes a file handle and a
+    /// directory handle — so this is the directory counterpart of ``SFTPFile/close()`` and sends
+    /// the identical message. It is a method of the client rather than of a handle wrapper because
+    /// `opendir` hands back a bare ``SFTPMessage/Handle`` with no owner.
+    internal func closeHandle(_ handle: ByteBuffer) async throws {
+        let result = try await sendRequest(.closeFile(.init(
+            requestId: self.allocateRequestId(),
+            handle: handle
+        )))
+
+        guard case .status(let status) = result else {
+            throw SFTPError.invalidResponse
+        }
+
+        guard status.errorCode == .ok else {
+            throw SFTPError.errorStatus(status)
+        }
     }
     
     /// Get the attributes of a file on the SFTP server.

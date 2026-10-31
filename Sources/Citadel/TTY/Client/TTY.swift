@@ -256,9 +256,16 @@ extension SSHClient {
         environment: [SSHChannelRequestEvent.EnvironmentRequest] = [],
         inShell: Bool = false
     ) async throws -> AsyncThrowingStream<ExecCommandOutput, Error> {
+        // `closeChannelOnTermination: true` because THIS entry point drops the `Channel`: it
+        // returns `.output` only, so its caller has nothing left to close. Without it, a consumer
+        // that stops iterating — or whose task is cancelled — sent no channel close and the remote
+        // command kept running to its own end. The `with*` wrappers below keep the channel and
+        // close it themselves, so they must NOT ask for this: a channel closed twice fails their
+        // `try await channel.close()` with `ChannelError.alreadyClosed`.
         try await _executeCommandStream(
             environment: environment,
-            mode: inShell ? .tty(command: command) : .command(command)
+            mode: inShell ? .tty(command: command) : .command(command),
+            closeChannelOnTermination: true
         ).output
     }
 
@@ -266,9 +273,13 @@ extension SSHClient {
         case pty(SSHChannelRequestEvent.PseudoTerminalRequest), tty(command: String?), command(String)
     }
 
+    /// - Parameter closeChannelOnTermination: when `true`, dropping or finishing the returned
+    ///   stream closes the channel. Only for callers that do not keep the channel — see
+    ///   ``executeCommandStream(_:environment:inShell:)``.
     internal func _executeCommandStream(
         environment: [SSHChannelRequestEvent.EnvironmentRequest] = [],
-        mode: CommandMode
+        mode: CommandMode,
+        closeChannelOnTermination: Bool = false
     ) async throws -> (channel: Channel, output: AsyncThrowingStream<ExecCommandOutput, Error>) {
         let (stream, streamContinuation) = AsyncThrowingStream<ExecCommandOutput, Error>.makeStream()
 
@@ -337,6 +348,41 @@ extension SSHClient {
             ))
         }
         
+        // Installed HERE and not next to `makeStream()` above, because the channel does not exist
+        // yet at that point. `promise: nil` and no `try` anywhere in it: this runs on the stream's
+        // termination, where there is no caller left to hand an error to.
+        //
+        // **The two termination reasons are NOT the same event, and closing alone is not enough.**
+        //
+        // - `.cancelled` — the consumer walked away or its task was cancelled, so the remote
+        //   command is presumed to be STILL RUNNING. Closing the channel does not end it:
+        //   OpenSSH's `sshd` sends no `SIGHUP` for a non-pty session and only closes its end of
+        //   the pipes, so a command that is not writing at that moment runs to its own end, AND
+        //   `sshd` keeps the session slot allocated while its child lives — measured against
+        //   OpenSSH 10.3p1 on loopback: a cancelled `sleep 300` was still alive 30 s later with
+        //   the close alone, and nine such channels exhausted a `MaxSessions 10` server. So the
+        //   server is ASKED to signal the remote process first (RFC 4254 §6.9 `signal`), and only
+        //   then is the channel closed. Measured with the same harness: the command, and the
+        //   child of the `sh -c` wrapper that started it, were both gone on the first poll.
+        // - `.finished` — the command already ended, the server has already sent its close, and a
+        //   channel request there is a protocol violation ("Sent channel request on closed
+        //   channel", measured 157 times in one probe run before this was split). So that case
+        //   only closes.
+        if closeChannelOnTermination {
+            streamContinuation.onTermination = { reason in
+                switch reason {
+                case .cancelled:
+                    channel.triggerUserOutboundEvent(
+                        SSHChannelRequestEvent.SignalRequest(signal: "TERM")
+                    ).whenComplete { _ in
+                        channel.close(promise: nil)
+                    }
+                default:
+                    channel.close(promise: nil)
+                }
+            }
+        }
+
         return (channel, stream)
     }
 
