@@ -576,4 +576,78 @@ final class WithExecTests: XCTestCase {
             XCTAssertEqual(execDelegate.receivedEnv["BAZ"], "qux")
         }
     }
+
+    /// `withPTYExec` sends a `PseudoTerminalRequest` followed by an `ExecRequest` (never a `ShellRequest`),
+    /// so the server's `ExecDelegate` receives the exact command while `ShellDelegate` is not invoked.
+    func testWithPTYExecExecutesCommandOnPTYChannelWithoutInvokingInteractiveShell() async throws {
+        final class ExecSpy: ExecDelegate, @unchecked Sendable {
+            struct Ctx: ExecCommandContext {
+                func terminate() async throws {}
+            }
+            let receivedCommand = NIOLockedValueBox<String?>(nil)
+            func setEnvironmentValue(_ value: String, forKey key: String) async throws {}
+            func start(command: String, outputHandler: ExecOutputHandler) async throws -> ExecCommandContext {
+                receivedCommand.withLockedValue { $0 = command }
+                DispatchQueue.global().async {
+                    let output = outputHandler.stdoutPipe.fileHandleForWriting
+                    output.write(Data("pty-exec-ok".utf8))
+                    try? output.close()
+                    Thread.sleep(forTimeInterval: 0.3)
+                    outputHandler.succeed(exitCode: 0)
+                }
+                return Ctx()
+            }
+        }
+
+        final class ForbiddenShellSpy: ShellDelegate, @unchecked Sendable {
+            let wasInvoked = NIOLockedValueBox<Bool>(false)
+            func startShell(
+                inbound: AsyncStream<ShellClientEvent>,
+                outbound: ShellOutboundWriter,
+                context: SSHShellContext
+            ) async throws {
+                wasInvoked.withLockedValue { $0 = true }
+            }
+        }
+
+        try await runTest { server, client in
+            let execSpy = ExecSpy()
+            let shellSpy = ForbiddenShellSpy()
+            server.enableExec(withDelegate: execSpy)
+            server.enableShell(withDelegate: shellSpy)
+
+            let ptyRequest = SSHChannelRequestEvent.PseudoTerminalRequest(
+                wantReply: true,
+                term: "xterm-256color",
+                terminalCharacterWidth: 80,
+                terminalRowHeight: 24,
+                terminalPixelWidth: 0,
+                terminalPixelHeight: 0,
+                terminalModes: .init([:])
+            )
+
+            try await client.withPTYExec(
+                ptyRequest,
+                command: "/bin/sh -c 'tmux attach -t =work'"
+            ) { inbound, outbound in
+                try await outbound.changeSize(cols: 100, rows: 32, pixelWidth: 0, pixelHeight: 0)
+                var collected = ByteBuffer()
+                for try await chunk in inbound {
+                    if case .stdout(let buf) = chunk {
+                        collected.writeImmutableBuffer(buf)
+                    }
+                }
+                XCTAssertEqual(String(buffer: collected), "pty-exec-ok")
+            }
+
+            XCTAssertEqual(
+                execSpy.receivedCommand.withLockedValue { $0 },
+                "/bin/sh -c 'tmux attach -t =work'"
+            )
+            XCTAssertFalse(
+                shellSpy.wasInvoked.withLockedValue { $0 },
+                "withPTYExec must send ExecRequest, never ShellRequest"
+            )
+        }
+    }
 }
