@@ -577,23 +577,34 @@ final class WithExecTests: XCTestCase {
         }
     }
 
-    /// `withPTYExec` sends a `PseudoTerminalRequest` followed by an `ExecRequest` (never a `ShellRequest`),
-    /// so the server's `ExecDelegate` receives the exact command while `ShellDelegate` is not invoked.
+    /// `withPTYExec` sends `EnvironmentRequest`, `PseudoTerminalRequest`, and `ExecRequest` in order
+    /// (never `ShellRequest`), forwards `WindowChangeRequest`, delivers stdout, and returns cleanly
+    /// without throwing `ChannelError.alreadyClosed` when the remote command exits first.
     func testWithPTYExecExecutesCommandOnPTYChannelWithoutInvokingInteractiveShell() async throws {
+        struct UncheckedOutputBox: @unchecked Sendable {
+            let handler: ExecOutputHandler
+        }
+
         final class ExecSpy: ExecDelegate, @unchecked Sendable {
             struct Ctx: ExecCommandContext {
                 func terminate() async throws {}
             }
             let receivedCommand = NIOLockedValueBox<String?>(nil)
-            func setEnvironmentValue(_ value: String, forKey key: String) async throws {}
+            let receivedEnv = NIOLockedValueBox<[String: String]>([:])
+
+            func setEnvironmentValue(_ value: String, forKey key: String) async throws {
+                receivedEnv.withLockedValue { $0[key] = value }
+            }
+
             func start(command: String, outputHandler: ExecOutputHandler) async throws -> ExecCommandContext {
                 receivedCommand.withLockedValue { $0 = command }
+                let box = UncheckedOutputBox(handler: outputHandler)
                 DispatchQueue.global().async {
-                    let output = outputHandler.stdoutPipe.fileHandleForWriting
+                    let output = box.handler.stdoutPipe.fileHandleForWriting
                     output.write(Data("pty-exec-ok".utf8))
                     try? output.close()
                     Thread.sleep(forTimeInterval: 0.3)
-                    outputHandler.succeed(exitCode: 0)
+                    box.handler.succeed(exitCode: 0)
                 }
                 return Ctx()
             }
@@ -625,29 +636,121 @@ final class WithExecTests: XCTestCase {
                 terminalPixelHeight: 0,
                 terminalModes: .init([:])
             )
+            let expectedCommand = "/bin/sh -c 'tmux attach -t =work'"
+            let capturedHandler = NIOLockedValueBox<ExecCommandHandler?>(nil)
+            let didReturnCleanly = NIOLockedValueBox<Bool>(false)
 
-            try await client.withPTYExec(
-                ptyRequest,
-                command: "/bin/sh -c 'tmux attach -t =work'"
-            ) { inbound, outbound in
-                try await outbound.changeSize(cols: 100, rows: 32, pixelWidth: 0, pixelHeight: 0)
-                var collected = ByteBuffer()
-                for try await chunk in inbound {
-                    if case .stdout(let buf) = chunk {
-                        collected.writeImmutableBuffer(buf)
+            do {
+                try await client.withPTYExec(
+                    ptyRequest,
+                    command: expectedCommand,
+                    environment: [.init(wantReply: true, name: "LC_CTYPE", value: "UTF-8")]
+                ) { inbound, outbound in
+                    let handler = try await outbound.channel.pipeline.handler(type: ExecCommandHandler.self).get()
+                    capturedHandler.withLockedValue { $0 = handler }
+                    try await outbound.changeSize(cols: 100, rows: 32, pixelWidth: 640, pixelHeight: 384)
+
+                    var collected = ByteBuffer()
+                    for try await chunk in inbound {
+                        if case .stdout(let buf) = chunk {
+                            collected.writeImmutableBuffer(buf)
+                        }
                     }
+                    XCTAssertEqual(String(buffer: collected), "pty-exec-ok")
+                    XCTAssertEqual(
+                        handler.recordedOutboundRequests.withLockedValue { $0 },
+                        [
+                            .environment(name: "LC_CTYPE", value: "UTF-8"),
+                            .pty(term: "xterm-256color", cols: 80, rows: 24),
+                            .exec(command: expectedCommand, wantReply: true),
+                            .windowChange(cols: 100, rows: 32, pixelWidth: 640, pixelHeight: 384),
+                        ]
+                    )
+                    XCTAssertEqual(execSpy.receivedCommand.withLockedValue { $0 }, expectedCommand)
+                    XCTAssertFalse(
+                        shellSpy.wasInvoked.withLockedValue { $0 },
+                        "withPTYExec must send ExecRequest, never ShellRequest"
+                    )
                 }
-                XCTAssertEqual(String(buffer: collected), "pty-exec-ok")
+                didReturnCleanly.withLockedValue { $0 = true }
+            } catch {
+                XCTFail("withPTYExec must return cleanly after normal server-side exit, but threw: \(error)")
             }
 
-            XCTAssertEqual(
-                execSpy.receivedCommand.withLockedValue { $0 },
-                "/bin/sh -c 'tmux attach -t =work'"
+            XCTAssertTrue(
+                didReturnCleanly.withLockedValue { $0 },
+                "withPTYExec must complete normally without throwing ChannelError.alreadyClosed"
             )
+            let recorded = capturedHandler.withLockedValue { $0 }?.recordedOutboundRequests.withLockedValue { $0 }
+            XCTAssertEqual(
+                recorded,
+                [
+                    .environment(name: "LC_CTYPE", value: "UTF-8"),
+                    .pty(term: "xterm-256color", cols: 80, rows: 24),
+                    .exec(command: expectedCommand, wantReply: true),
+                    .windowChange(cols: 100, rows: 32, pixelWidth: 640, pixelHeight: 384),
+                ]
+            )
+            XCTAssertEqual(execSpy.receivedCommand.withLockedValue { $0 }, expectedCommand)
+            XCTAssertEqual(execSpy.receivedEnv.withLockedValue { $0["LC_CTYPE"] }, "UTF-8")
             XCTAssertFalse(
                 shellSpy.wasInvoked.withLockedValue { $0 },
                 "withPTYExec must send ExecRequest, never ShellRequest"
             )
+        }
+    }
+
+    /// When the remote command exits with a non-zero status and the server closes the channel,
+    /// `withPTYExec` propagates `SSHClient.CommandFailed(exitCode:)` rather than masking it with
+    /// `ChannelError.alreadyClosed`.
+    func testWithPTYExecPropagatesNonZeroExitCodeWithoutMaskingAsAlreadyClosed() async throws {
+        struct UncheckedOutputBox: @unchecked Sendable {
+            let handler: ExecOutputHandler
+        }
+
+        final class FailingExecSpy: ExecDelegate, @unchecked Sendable {
+            struct Ctx: ExecCommandContext {
+                func terminate() async throws {}
+            }
+            func setEnvironmentValue(_ value: String, forKey key: String) async throws {}
+            func start(command: String, outputHandler: ExecOutputHandler) async throws -> ExecCommandContext {
+                let box = UncheckedOutputBox(handler: outputHandler)
+                DispatchQueue.global().async {
+                    try? box.handler.stdoutPipe.fileHandleForWriting.close()
+                    Thread.sleep(forTimeInterval: 0.1)
+                    box.handler.succeed(exitCode: 7)
+                }
+                return Ctx()
+            }
+        }
+
+        try await runTest { server, client in
+            server.enableExec(withDelegate: FailingExecSpy())
+
+            let ptyRequest = SSHChannelRequestEvent.PseudoTerminalRequest(
+                wantReply: true,
+                term: "xterm-256color",
+                terminalCharacterWidth: 80,
+                terminalRowHeight: 24,
+                terminalPixelWidth: 0,
+                terminalPixelHeight: 0,
+                terminalModes: .init([:])
+            )
+
+            var caughtError: Error?
+            do {
+                try await client.withPTYExec(ptyRequest, command: "exit 7") { inbound, _ in
+                    for try await _ in inbound {}
+                }
+            } catch {
+                caughtError = error
+            }
+
+            guard let commandFailed = caughtError as? SSHClient.CommandFailed else {
+                XCTFail("Expected SSHClient.CommandFailed(exitCode: 7), got: \(String(describing: caughtError))")
+                return
+            }
+            XCTAssertEqual(commandFailed.exitCode, 7)
         }
     }
 }

@@ -101,6 +101,15 @@ final class ExecCommandHandler: ChannelDuplexHandler, Sendable {
         case eof(Error?)
         case exit(Int)
     }
+
+    enum RecordedOutboundRequest: Equatable, Sendable {
+        case environment(name: String, value: String)
+        case pty(term: String, cols: Int, rows: Int)
+        case exec(command: String, wantReply: Bool)
+        case shell(wantReply: Bool)
+        case windowChange(cols: Int, rows: Int, pixelWidth: Int, pixelHeight: Int)
+        case signal(String)
+    }
     
     typealias InboundIn = SSHChannelData
     typealias InboundOut = ByteBuffer
@@ -109,6 +118,7 @@ final class ExecCommandHandler: ChannelDuplexHandler, Sendable {
 
     let logger: Logger
     let onOutput: @Sendable (Channel, Output) -> Void
+    let recordedOutboundRequests = NIOLockedValueBox<[RecordedOutboundRequest]>([])
 
     init(
         logger: Logger,
@@ -123,6 +133,47 @@ final class ExecCommandHandler: ChannelDuplexHandler, Sendable {
             self.logger.debug("Failed to set allowRemoteHalfClosure: \(error)")
             context.fireErrorCaught(error)
         }
+    }
+
+    func triggerUserOutboundEvent(context: ChannelHandlerContext, event: Any, promise: EventLoopPromise<Void>?) {
+        switch event {
+        case let env as SSHChannelRequestEvent.EnvironmentRequest:
+            recordedOutboundRequests.withLockedValue {
+                $0.append(.environment(name: env.name, value: env.value))
+            }
+        case let pty as SSHChannelRequestEvent.PseudoTerminalRequest:
+            recordedOutboundRequests.withLockedValue {
+                $0.append(.pty(
+                    term: pty.term,
+                    cols: pty.terminalCharacterWidth,
+                    rows: pty.terminalRowHeight
+                ))
+            }
+        case let exec as SSHChannelRequestEvent.ExecRequest:
+            recordedOutboundRequests.withLockedValue {
+                $0.append(.exec(command: exec.command, wantReply: exec.wantReply))
+            }
+        case let shell as SSHChannelRequestEvent.ShellRequest:
+            recordedOutboundRequests.withLockedValue {
+                $0.append(.shell(wantReply: shell.wantReply))
+            }
+        case let win as SSHChannelRequestEvent.WindowChangeRequest:
+            recordedOutboundRequests.withLockedValue {
+                $0.append(.windowChange(
+                    cols: win.terminalCharacterWidth,
+                    rows: win.terminalRowHeight,
+                    pixelWidth: win.terminalPixelWidth,
+                    pixelHeight: win.terminalPixelHeight
+                ))
+            }
+        case let sig as SSHChannelRequestEvent.SignalRequest:
+            recordedOutboundRequests.withLockedValue {
+                $0.append(.signal(sig.signal))
+            }
+        default:
+            break
+        }
+        context.triggerUserOutboundEvent(event, promise: promise)
     }
 
     func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
@@ -443,7 +494,12 @@ extension SSHClient {
         )
 
         func close() async throws {
-            try await channel.close()
+            do {
+                try await channel.close()
+            } catch let error as ChannelError where error == .alreadyClosed {
+                // When the remote command exits normally (e.g. `tmux detach-client` or shell `exit`),
+                // the SSH server closes the channel before `perform` returns.
+            }
         }
 
         do {
@@ -451,7 +507,7 @@ extension SSHClient {
             try await perform(inbound, TTYStdinWriter(channel: channel))
             try await close()
         } catch {
-            try await close()
+            try? await close()
             throw error
         }
     }
