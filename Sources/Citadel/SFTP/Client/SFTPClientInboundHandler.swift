@@ -48,4 +48,17 @@ final class SFTPClientInboundHandler: ChannelInboundHandler {
             context.fireErrorCaught(SFTPError.invalidResponse)
         }
     }
+
+    /// The server's `SSH_MSG_CHANNEL_EOF` (Duomote fork).
+    ///
+    /// `SSHChannelDataUnwrapper` enables remote half-closure, so the EOF does not close the
+    /// channel: it arrives here as `ChannelEvent.inputClosed` and the channel stays active. Nobody
+    /// handled it before, so every request waiting for a response waited for ever.
+    func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
+        if let event = event as? ChannelEvent, event == .inputClosed {
+            self.logger.info("SFTP server closed its sending direction; failing in-flight requests")
+            self.responses.markInputClosed()
+        }
+        context.fireUserInboundEventTriggered(event)
+    }
 }

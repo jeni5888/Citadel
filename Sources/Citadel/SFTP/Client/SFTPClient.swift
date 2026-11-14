@@ -9,7 +9,10 @@ import Logging
 /// Per specification, SFTP could be used over other transport layers, too.
 public final class SFTPClient: Sendable {
     /// The SSH child channel created for this connection.
-    fileprivate let channel: Channel
+    ///
+    /// `internal` rather than `fileprivate` (Duomote fork) so the half-closure tests can deliver
+    /// `ChannelEvent.inputClosed` through the real pipeline.
+    let channel: Channel
     
     /// A monotonically increasing counter for gneerating request IDs.
     private let _nextRequestId = NIOLockedValueBox<UInt32>(0)
@@ -64,8 +67,25 @@ public final class SFTPClient: Sendable {
     }
     
     /// True if the SFTP connection is still open, false otherwise.
+    ///
+    /// - Warning: This is the CHANNEL's state. The SFTP pipeline allows remote half-closure, so a
+    ///   server that sent `SSH_MSG_CHANNEL_EOF` without `SSH_MSG_CHANNEL_CLOSE` leaves this `true`
+    ///   for as long as the server keeps the channel — while no response can ever arrive again.
+    ///   Read ``isRemoteHalfClosed`` too before reusing a client.
     public var isActive: Bool {
         self.channel.isActive
+    }
+
+    /// True once the server has closed its sending direction (`SSH_MSG_CHANNEL_EOF`) on this
+    /// channel (Duomote fork).
+    ///
+    /// SFTP is request/response: after the server's EOF no response can arrive, so the client is
+    /// unusable even though ``isActive`` may stay `true` until the server also closes the channel.
+    /// From the moment this turns `true`, every request still in flight has failed with
+    /// ``SFTPError/connectionClosed`` and every new request fails with it immediately instead of
+    /// waiting for an answer that cannot come. It never turns back to `false`.
+    public var isRemoteHalfClosed: Bool {
+        self.responses.isInputClosed
     }
     
     /// The SFTP client's event loop.
@@ -86,6 +106,13 @@ public final class SFTPClient: Sendable {
     ///   unpredictable behavior.
     internal func sendRequest(_ request: SFTPRequest) async throws -> SFTPResponse {
         try await self.eventLoop.flatSubmit {
+            // Same event loop as `SFTPResponses.markInputClosed()`, so there is no window between
+            // this check and the registration below in which the EOF could slip through and leave
+            // the new promise waiting for ever.
+            if self.responses.isInputClosed {
+                return self.channel.eventLoop.makeFailedFuture(SFTPError.connectionClosed)
+            }
+
             let requestId = request.requestId
             let promise = self.channel.eventLoop.makePromise(of: SFTPResponse.self)
             
@@ -559,6 +586,33 @@ extension SSHClient {
     public func openSFTP(
         logger: Logger = .init(label: "nl.orlandos.citadel.sftp")
     ) async throws -> SFTPClient {
+        try await openSFTP(channelRequest: .subsystem, logger: logger)
+    }
+
+    /// Open an SFTP client on an EXEC channel that runs `execCommand` instead of requesting the
+    /// `sftp` subsystem (Duomote fork).
+    ///
+    /// The command must speak SFTP on its stdin/stdout, e.g. `/usr/libexec/sftp-server`. It exists
+    /// so a test can put the server side under a script — the only way to make a real OpenSSH
+    /// server half-close an SFTP channel (send EOF, keep the channel) without editing its
+    /// configuration. The client side, its handlers and every operation are exactly those of
+    /// ``openSFTP(logger:)``. The command is sent verbatim; quoting it is the caller's job.
+    public func openSFTP(
+        execCommand: String,
+        logger: Logger = .init(label: "nl.orlandos.citadel.sftp")
+    ) async throws -> SFTPClient {
+        try await openSFTP(channelRequest: .exec(execCommand), logger: logger)
+    }
+
+    enum SFTPChannelRequest {
+        case subsystem
+        case exec(String)
+    }
+
+    func openSFTP(
+        channelRequest: SFTPChannelRequest,
+        logger: Logger
+    ) async throws -> SFTPClient {
         try await eventLoop.flatSubmit { [eventLoop, sshHandler = session.sshHandler] in
             let createChannel = eventLoop.makePromise(of: Channel.self)
             let createClient = eventLoop.makePromise(of: SFTPClient.self)
@@ -584,15 +638,28 @@ extension SSHClient {
             return createChannel.futureResult.flatMap { channel in
                 let openSubsystem = eventLoop.makePromise(of: Void.self)
 
-                logger.debug("SFTP requesting subsystem")
+                switch channelRequest {
+                case .subsystem:
+                    logger.debug("SFTP requesting subsystem")
 
-                channel.triggerUserOutboundEvent(
-                    SSHChannelRequestEvent.SubsystemRequest(
-                        subsystem: "sftp",
-                        wantReply: true
-                    ),
-                    promise: openSubsystem
-                )
+                    channel.triggerUserOutboundEvent(
+                        SSHChannelRequestEvent.SubsystemRequest(
+                            subsystem: "sftp",
+                            wantReply: true
+                        ),
+                        promise: openSubsystem
+                    )
+                case .exec(let command):
+                    logger.debug("SFTP requesting exec of an SFTP server command")
+
+                    channel.triggerUserOutboundEvent(
+                        SSHChannelRequestEvent.ExecRequest(
+                            command: command,
+                            wantReply: true
+                        ),
+                        promise: openSubsystem
+                    )
+                }
                 return openSubsystem.futureResult
             }.flatMap {
                 logger.debug("SFTP subsystem request completed")
@@ -644,6 +711,33 @@ final class SFTPResponses: Sendable {
         }
     }
     
+    /// Set on the channel's event loop when the server's EOF arrives (Duomote fork).
+    let _inputClosed = NIOLockedValueBox<Bool>(false)
+    var isInputClosed: Bool {
+        _inputClosed.withLockedValue { $0 }
+    }
+
+    /// The server closed its sending direction: nothing pending can be answered any more.
+    ///
+    /// Fails every in-flight request and an initialisation that is still waiting for the server's
+    /// VERSION, and makes `SFTPClient.sendRequest` refuse new ones. Must run on the channel's event
+    /// loop (it is called from the inbound handler), which is what serialises it with
+    /// `sendRequest`'s check-then-register.
+    func markInputClosed() {
+        _inputClosed.withLockedValue { $0 = true }
+        let pending = _responses.withLockedValue { responses -> [EventLoopPromise<SFTPResponse>] in
+            let values = Array(responses.values)
+            responses.removeAll()
+            return values
+        }
+        if !self.isInitialized {
+            self.sftpVersion.fail(SFTPError.connectionClosed)
+        }
+        for promise in pending {
+            promise.fail(SFTPError.connectionClosed)
+        }
+    }
+
     func close() {
         self.isInitialized = false
         self.sftpVersion.fail(SFTPError.connectionClosed)
