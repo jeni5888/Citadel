@@ -187,6 +187,44 @@ extension EndToEndTests {
         )
     }
 
+    /// Fails every outbound write at once, without forwarding it.
+    final class FailWrites: ChannelOutboundHandler, @unchecked Sendable {
+        typealias OutboundIn = Any
+        struct WriteRefused: Error, Equatable {}
+        func write(context: ChannelHandlerContext, data: NIOAny, promise: EventLoopPromise<Void>?) {
+            promise?.fail(WriteRefused())
+        }
+    }
+
+    /// A failed WRITE (no EOF, no close) still fails its request — with the write's own error. The
+    /// response is no longer gated behind the write, so nothing but this hand-over ends it.
+    func testARequestWhoseWriteFailsFailsWithTheWritesError() async throws {
+        try await runTest(
+            perform: { server, client in
+                server.enableSFTP(withDelegate: GatedSFTP())
+                let sftp = try await client.openSFTP()
+                _ = try await sftp.getRealPath(atPath: "/healthy")   // positive control
+
+                try await sftp.channel.pipeline.addHandler(FailWrites(), position: .last).get()
+                let request = Task { try await sftp.getRealPath(atPath: "/refused-write") }
+                switch await Self.firstOutcome(of: request, watchdog: .seconds(10)) {
+                case .failed(let error as FailWrites.WriteRefused):
+                    XCTAssertEqual(error, FailWrites.WriteRefused())
+                case .failed(let error):
+                    XCTFail("the request failed with \(error), not the write's own error")
+                case .answered:
+                    XCTFail("the request was answered although its write was refused")
+                case .stillWaiting:
+                    XCTFail("the request still waits after its write failed")
+                }
+                XCTAssertFalse(sftp.isRemoteHalfClosed, "a refused write is not the server's EOF")
+                try? await sftp.close()
+            },
+            matchingError: { _ in false },
+            expectsFailure: false
+        )
+    }
+
     /// The other direction: an unrelated user event is NOT a half-closure.
     func testAnotherInboundEventDoesNotMarkTheClientHalfClosed() async throws {
         try await runTest(
