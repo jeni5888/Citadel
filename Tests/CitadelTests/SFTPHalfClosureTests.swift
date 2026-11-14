@@ -136,6 +136,57 @@ extension EndToEndTests {
         }
     }
 
+    /// Holds every outbound write and never completes its promise — what `SSHChildChannel` does with
+    /// a write while the peer's window is exhausted.
+    final class HoldWrites: ChannelOutboundHandler, @unchecked Sendable {
+        typealias OutboundIn = Any
+        var held: [EventLoopPromise<Void>?] = []
+        func write(context: ChannelHandlerContext, data: NIOAny, promise: EventLoopPromise<Void>?) {
+            held.append(promise)
+        }
+    }
+
+    /// A request whose WRITE is still pending when the server's EOF arrives fails with
+    /// `connectionClosed` too — it must not wait for a write the EOF never completes.
+    func testARequestWhoseWriteIsStillPendingFailsOnTheServersEOF() async throws {
+        try await runTest(
+            perform: { server, client in
+                server.enableSFTP(withDelegate: GatedSFTP())
+                let sftp = try await client.openSFTP()
+                _ = try await sftp.getRealPath(atPath: "/healthy")   // positive control
+
+                let holder = HoldWrites()
+                try await sftp.channel.pipeline.addHandler(holder, position: .last).get()
+                let pending = Task { try await sftp.getRealPath(atPath: "/held-write") }
+                for _ in 0..<500 {
+                    let count = try await sftp.channel.eventLoop.submit { holder.held.count }.get()
+                    if count > 0 { break }
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                let heldCount = try await sftp.channel.eventLoop.submit { holder.held.count }.get()
+                XCTAssertEqual(heldCount, 1, "premise: the request's write is held, not delivered")
+
+                try await sftp.channel.eventLoop.submit {
+                    sftp.channel.pipeline.fireUserInboundEventTriggered(ChannelEvent.inputClosed)
+                }.get()
+
+                switch await Self.firstOutcome(of: pending, watchdog: .seconds(10)) {
+                case .failed(SFTPError.connectionClosed):
+                    break
+                case .failed(let error):
+                    XCTFail("the held request failed with \(error), not SFTPError.connectionClosed")
+                case .answered:
+                    XCTFail("the held request was answered although its write never left")
+                case .stillWaiting:
+                    XCTFail("the held request still waits on its write after the server's EOF")
+                }
+                try? await sftp.close()
+            },
+            matchingError: { _ in false },
+            expectsFailure: false
+        )
+    }
+
     /// The other direction: an unrelated user event is NOT a half-closure.
     func testAnotherInboundEventDoesNotMarkTheClientHalfClosed() async throws {
         try await runTest(

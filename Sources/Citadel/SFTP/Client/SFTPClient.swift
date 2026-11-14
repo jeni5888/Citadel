@@ -125,9 +125,18 @@ public final class SFTPClient: Sendable {
             //logger.trace("SFTP OUT: \(message.debugRawBytesRepresentation)")
 
             self.responses.responses[requestId] = promise
-            return self.channel.writeAndFlush(request.makeMessage()).flatMap {
-                promise.futureResult
+            // The caller waits on the RESPONSE, not on the write (Duomote fork). A write can sit in
+            // `SSHChildChannel`'s pending queue while the peer's window is exhausted, and the server's
+            // EOF does not complete it — so a `flatMap` on the write kept the caller suspended after
+            // `markInputClosed` had already failed the response, and later surfaced the write's
+            // `ChannelError.eof` instead of `SFTPError.connectionClosed`. A write that fails still
+            // fails the request: its error is handed to the response promise, if that is still pending.
+            self.channel.writeAndFlush(message).whenFailure { error in
+                if let pending = self.responses.removeResponse(requestId) {
+                    pending.fail(error)
+                }
             }
+            return promise.futureResult
         }.get()
     }
 
@@ -711,6 +720,11 @@ final class SFTPResponses: Sendable {
         }
     }
     
+    /// Removes and returns the pending promise for `requestId`, if any (Duomote fork).
+    func removeResponse(_ requestId: UInt32) -> EventLoopPromise<SFTPResponse>? {
+        _responses.withLockedValue { $0.removeValue(forKey: requestId) }
+    }
+
     /// Set on the channel's event loop when the server's EOF arrives (Duomote fork).
     let _inputClosed = NIOLockedValueBox<Bool>(false)
     var isInputClosed: Bool {
